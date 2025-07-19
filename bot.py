@@ -1,16 +1,117 @@
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from database import *
-from utils import fake_visit, delete_expired_links
+from datetime import datetime, timedelta
+import sqlite3
+import threading
+import time
+import random
+import requests
 
+# === CONFIG ===
 BOT_TOKEN = "7854510116:AAEpFEs3b_YVNs4jvFH6d1JOZ5Dern69_Sg"
 bot = telebot.TeleBot(BOT_TOKEN)
-
 admin_id = 6976365864
-
-# Track task completion per user (start screen)
 user_tasks = {}
 
+# === DATABASE SETUP ===
+conn = sqlite3.connect("bot_data.db", check_same_thread=False)
+cursor = conn.cursor()
+
+# Users table
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    telegram_id TEXT UNIQUE,
+    username TEXT,
+    is_premium INTEGER DEFAULT 0,
+    referrals INTEGER DEFAULT 0,
+    premium_expiry TEXT
+)
+''')
+
+# Links table
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS links (
+    id INTEGER PRIMARY KEY,
+    telegram_id TEXT,
+    url TEXT,
+    interval INTEGER,
+    added_at TEXT,
+    expires_at TEXT,
+    active INTEGER DEFAULT 1
+)
+''')
+conn.commit()
+
+# === DATABASE FUNCTIONS ===
+def add_user(telegram_id, username):
+    cursor.execute("INSERT OR IGNORE INTO users (telegram_id, username) VALUES (?, ?)", (telegram_id, username))
+    conn.commit()
+
+def get_user(telegram_id):
+    cursor.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+    return cursor.fetchone()
+
+def update_referral(telegram_id):
+    cursor.execute("UPDATE users SET referrals = referrals + 1 WHERE telegram_id = ?", (telegram_id,))
+    conn.commit()
+
+def set_premium(telegram_id, months):
+    expiry = (datetime.now() + timedelta(days=30 * months)).isoformat()
+    cursor.execute("UPDATE users SET is_premium = 1, premium_expiry = ? WHERE telegram_id = ?", (expiry, telegram_id))
+    conn.commit()
+
+def add_link(telegram_id, url, interval, duration_days):
+    now = datetime.now()
+    expires = now + timedelta(days=duration_days)
+    cursor.execute("INSERT INTO links (telegram_id, url, interval, added_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                   (telegram_id, url, interval, now.isoformat(), expires.isoformat()))
+    conn.commit()
+
+def get_links_by_user(telegram_id):
+    cursor.execute("SELECT * FROM links WHERE telegram_id = ? AND active = 1", (telegram_id,))
+    return cursor.fetchall()
+
+def stop_link(link_id):
+    cursor.execute("UPDATE links SET active = 0 WHERE id = ?", (link_id,))
+    conn.commit()
+
+def delete_expired_links():
+    now = datetime.now().isoformat()
+    cursor.execute("UPDATE links SET active = 0 WHERE expires_at < ?", (now,))
+    conn.commit()
+
+def get_all_active_links():
+    cursor.execute("SELECT * FROM links WHERE active = 1")
+    return cursor.fetchall()
+
+# === UTILS ===
+user_agents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_2 like Mac OS X)",
+    "Mozilla/5.0 (Linux; Android 11; SM-G991B)",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0)",
+    "Mozilla/5.0 (Linux; Android 9; Mi A1)",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:89.0)",
+    "Mozilla/5.0 (Linux; Android 8.0.0; Pixel 2 XL)"
+]
+
+def fake_visit(url, interval):
+    def visit_loop():
+        while True:
+            headers = {"User-Agent": random.choice(user_agents)}
+            try:
+                response = requests.get(url, headers=headers, timeout=5)
+                print(f"[✓] Visited: {url} - Status {response.status_code}")
+            except Exception as e:
+                print(f"[!] Error visiting {url}: {e}")
+            time.sleep(interval)
+    thread = threading.Thread(target=visit_loop)
+    thread.daemon = True
+    thread.start()
+
+# === START COMMAND ===
 @bot.message_handler(commands=["start"])
 def start(message):
     telegram_id = str(message.from_user.id)
@@ -46,7 +147,7 @@ def show_main_menu(message):
     markup.row("🆘 Help", "📞 Admin Contact")
     bot.send_message(message.chat.id, "👇 Main Menu", reply_markup=markup)
 
-# ➕ ADD LINK
+# === ADD LINK ===
 @bot.message_handler(func=lambda m: m.text == "➕ Add Link")
 def add_link_start(message):
     telegram_id = str(message.from_user.id)
@@ -55,7 +156,6 @@ def add_link_start(message):
     if user[3] == 0 and len(links) >= 1 and user[4] < 3:
         bot.reply_to(message, "🚫 Free users can only add 1 link.\nRefer 3 users or go premium.")
         return
-
     msg = bot.reply_to(message, "🔗 Send the link to boost:")
     bot.register_next_step_handler(msg, ask_time)
 
@@ -80,7 +180,7 @@ def save_link(message, url):
     fake_visit(url, interval)
     bot.send_message(message.chat.id, f"✅ Your link is now being visited every {interval} seconds.")
 
-# 📋 MY LINK
+# === MY LINK ===
 @bot.message_handler(func=lambda m: m.text == "📋 My Link")
 def my_links(message):
     telegram_id = str(message.from_user.id)
@@ -88,18 +188,17 @@ def my_links(message):
     if not links:
         bot.reply_to(message, "⛔ You have no active links.")
         return
-
     for link in links:
         bot.send_message(
             message.chat.id,
             f"🔗 {link[2]}\n⏱ Every {link[3]}s\n🗓 Expires: {link[5][:10]}",
         )
 
-# 💎 BUY PREMIUM
+# === BUY PREMIUM ===
 @bot.message_handler(func=lambda m: m.text == "💎 Buy Premium")
 def buy_premium(message):
     bot.send_message(message.chat.id, (
-        "💎 *Buy Premium Access*\n\n"
+        "💎 Buy Premium Access\n\n"
         "🔓 Premium Plans:\n"
         "• $5 → 3 months\n"
         "• $10 → 6 months\n"
@@ -107,14 +206,14 @@ def buy_premium(message):
         "• $50 → Lifetime access\n\n"
         "📩 Pay with BNB or USDT (BEP20) to:\n"
         "`0xa84bd2cfbBad66Ae2c5daf9aCe764dc845b94C7C`\n\n"
-        "⚠️ After payment, send *screenshot & TX hash* to Admin below ⬇️",
+        "⚠️ After payment, send screenshot & TX hash to Admin below ⬇️",
     ), parse_mode="Markdown")
 
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("📤 Send Proof to Admin", url="https://wa.me/2349114301708?text=Hi!%20From%20your%20bot%20on%20Telegram"))
     bot.send_message(message.chat.id, "⬇️ Click below to submit proof", reply_markup=markup)
 
-# 👥 REFERRALS (basic template)
+# === REFERRALS ===
 @bot.message_handler(func=lambda m: m.text == "👥 Referrals")
 def referral_handler(message):
     telegram_id = str(message.from_user.id)
@@ -123,11 +222,11 @@ def referral_handler(message):
     referred = user[4]
     bot.send_message(message.chat.id, f"👥 You’ve referred {referred}/3 users.\n\nShare your link:\n{link}")
 
-# 🆘 HELP
+# === HELP ===
 @bot.message_handler(func=lambda m: m.text == "🆘 Help")
 def help_handler(message):
     bot.send_message(message.chat.id, (
-        "📖 *Bot Guide*\n\n"
+        "📖 Bot Guide\n\n"
         "• Add Link: Submit any link to get auto-visited\n"
         "• Free users: 1 link for 3 days\n"
         "• Referrals: Invite 3 friends = 1 link for 1 day\n"
@@ -135,22 +234,21 @@ def help_handler(message):
         "• Contact Admin if stuck\n"
     ), parse_mode="Markdown")
 
-# 📞 ADMIN CONTACT
+# === CONTACT ADMIN ===
 @bot.message_handler(func=lambda m: m.text == "📞 Admin Contact")
 def contact_admin(message):
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("📞 Message Admin on WhatsApp", url="https://wa.me/2349114301708?text=Hi!%20From%20your%20bot%20on%20Telegram"))
     bot.send_message(message.chat.id, "Need help? Contact admin below:", reply_markup=markup)
 
-# ⏰ Delete expired links every few hours
-import threading, time
+# === CLEANUP TASK ===
 def cleanup_task():
     while True:
         delete_expired_links()
-        time.sleep(3600)
+        time.sleep(3600)  # 1 hour
 
 threading.Thread(target=cleanup_task, daemon=True).start()
 
-# Start bot
+# === RUN BOT ===
 print("✅ Bot is running...")
 bot.infinity_polling()
